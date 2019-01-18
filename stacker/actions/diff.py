@@ -10,7 +10,12 @@ from operator import attrgetter
 
 from .base import plan, build_walker
 from . import build
-from .. import exceptions
+from ..exceptions import (
+    MissingParameterException,
+    StackDidNotChange,
+    StackDoesNotExist,
+    CancelExecution,
+)
 from ..util import parse_cloudformation_template
 from ..status import (
     NotSubmittedStatus,
@@ -18,6 +23,8 @@ from ..status import (
     COMPLETE,
     INTERRUPTED,
 )
+
+# import pdb; pdb.set_trace()
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +215,71 @@ class Action(build.Action):
 
         print("\nNew template contents:")
         print("".join(stack))
+
+    def _diff_stack_new(self, stack, **kwargs):
+        """Handles the diffing a stack in CloudFormation vs our config"""
+        if self.cancel.wait(0):
+            return INTERRUPTED
+
+        if not build.should_submit(stack):
+            return NotSubmittedStatus()
+
+        if not build.should_update(stack):
+            return NotUpdatedStatus()
+
+        provider = self.build_provider(stack)
+
+        try:
+            provider_stack = provider.get_stack(stack.fqn)
+        except StackDoesNotExist:
+            provider_stack = None
+            old_template = None
+            old_params = {}
+
+        if provider_stack:
+            # get the current stack template & params from AWS
+            try:
+                [old_template, old_params] = provider.get_stack_info(
+                    provider_stack)
+            except StackDoesNotExist:
+                old_template = None
+                old_params = {}
+
+        stack.resolve(self.context, provider)
+        # generate our own template & params
+        parameters = self.build_parameters(stack)
+        new_params = dict()
+        for p in parameters:
+            new_params[p['ParameterKey']] = p['ParameterValue']
+        new_template = stack.blueprint.rendered
+        new_stack = normalize_json(new_template)
+
+        print("============== Stack: %s ==============" % (stack.name,))
+        # If this is a completely new template dump our params & stack
+        if not old_template:
+            self._print_new_stack(new_stack, parameters)
+        else:
+            # Diff our old & new stack/parameters
+            old_template = parse_cloudformation_template(old_template)
+            if isinstance(old_template, str):
+                # YAML templates returned from CFN need parsing again
+                # "AWSTemplateFormatVersion: \"2010-09-09\"\nParam..."
+                # ->
+                # AWSTemplateFormatVersion: "2010-09-09"
+                old_template = parse_cloudformation_template(old_template)
+            old_stack = normalize_json(
+                json.dumps(old_template,
+                           sort_keys=True,
+                           indent=4,
+                           default=str)
+            )
+            print_stack_changes(stack.name, new_stack, old_stack, new_params,
+                                old_params)
+
+        stack.set_outputs(
+            provider.get_output_dict(provider_stack))
+
+        return COMPLETE
 
     def _diff_stack(self, stack, **kwargs):
         """Handles the diffing a stack in CloudFormation vs our config"""
